@@ -9,8 +9,18 @@ namespace {
 bool ContainsPredictionPlaceholder(const weasel::Context& context) {
   // Only suppress the explicit placeholder. The prediction-visible state may
   // outlive the placeholder and must not hide normal composing text.
+  // The placeholder can surface in the preedit in two forms: the raw
+  // placeholder letters ("zpredictz"), or, once a predict candidate whose
+  // preedit is the invisible zero-width space (U+200B) gets highlighted,
+  // a single U+200B. librime's Composition::GetPreedit() prefers the
+  // highlighted candidate's preedit over the input text, so the client must
+  // recognize both; otherwise the zero-width space would be written into the
+  // text field as inline preedit and linger after the composition ends.
   static constexpr wchar_t kPredictionPlaceholder[] = L"zpredictz";
-  return context.preedit.str.find(kPredictionPlaceholder) != std::wstring::npos;
+  static constexpr wchar_t kZeroWidthSpace = L'\u200B';
+  const std::wstring& preedit = context.preedit.str;
+  return preedit.find(kPredictionPlaceholder) != std::wstring::npos ||
+         preedit.find(kZeroWidthSpace) != std::wstring::npos;
 }
 
 bool ShouldSuppressPredictionPlaceholder(const weasel::Context& context) {
@@ -65,8 +75,12 @@ STDAPI CStartCompositionEditSession::DoEditSession(TfEditCookie ec) {
      * composition is filled with characters. So we insert a zero width space
      * here. The workaround is only needed when inline preedit is not enabled.
      *   See https://github.com/rime/weasel/pull/883#issuecomment-1567625762
+     *   _fCUASWorkaroundEnabled already carries "CUAS detected AND inline
+     * preedit disabled" (see _StartComposition callers), so this must not
+     * write the placeholder into plain Win32/Electron applications, where it
+     * would linger in the text field after the composition ends.
      */
-    if (!_inlinePreeditEnabled) {
+    if (_fCUASWorkaroundEnabled) {
       static constexpr wchar_t kZeroWidthSpace[] = L"\u200B";
       pRangeComposition->SetText(ec, TF_ST_CORRECTION, kZeroWidthSpace, 1);
     }
@@ -301,10 +315,15 @@ STDAPI CInlinePreeditEditSession::DoEditSession(TfEditCookie ec) {
 
   /* TODO: Check the availability and correctness of these values */
   int sel_cursor = -1;
-  for (size_t i = 0; i < _context->preedit.attributes.size(); i++) {
-    if (_context->preedit.attributes.at(i).type == weasel::HIGHLIGHTED) {
-      sel_cursor = _context->preedit.attributes.at(i).range.cursor;
-      break;
+  // While suppressing the prediction placeholder the composition text is
+  // empty; honouring the highlight range of the placeholder itself would
+  // shift the caret past the cleared range.
+  if (!suppress_prediction_placeholder) {
+    for (size_t i = 0; i < _context->preedit.attributes.size(); i++) {
+      if (_context->preedit.attributes.at(i).type == weasel::HIGHLIGHTED) {
+        sel_cursor = _context->preedit.attributes.at(i).range.cursor;
+        break;
+      }
     }
   }
 
@@ -419,6 +438,31 @@ STDAPI WeaselTSF::OnCompositionTerminated(TfEditCookie ecWrite,
   // NOTE:
   // This will be called when an edit session ended up with an empty composition
   // string, Even if it is closed normally. Silly M$.
+
+  // This is also called when the application terminates our composition,
+  // e.g. the caret moves away without pressing Enter/Esc. In non-inline-preedit
+  // mode the CUAS workaround (CStartCompositionEditSession) fills the
+  // composition with a zero-width space (U+200B) so that GetTextExt() reports a
+  // usable position for the candidate window; once the composition is gone,
+  // that character stays in the document as ordinary text. The cleanup
+  // requested by _AbortComposition() below goes through an asynchronous edit
+  // session (TF_ES_ASYNCDONTCARE), which is unreliable right after the app
+  // itself has ended its edit session, so the placeholder can linger. Clear it
+  // synchronously here while the write cookie passed by the callback is still
+  // valid -- but only when the composition holds exactly the placeholder, so
+  // committed text (normal close) is never touched.
+  if (pComposition && pComposition == _pComposition) {
+    com_ptr<ITfRange> pCompositionRange;
+    if (pComposition->GetRange(&pCompositionRange) == S_OK) {
+      wchar_t placeholder[2] = {0, 0};
+      ULONG cch = 0;
+      if (pCompositionRange->GetText(ecWrite, 0, placeholder, 1, &cch) ==
+              S_OK &&
+          cch == 1 && placeholder[0] == L'\u200B') {
+        pCompositionRange->SetText(ecWrite, 0, L"", 0);
+      }
+    }
+  }
 
   _AbortComposition();
   return S_OK;
